@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Visible Benchmark (Optimized 2D)</title>
+<style>
+  body { margin:0; background:#000; color:#0f0; font-family:monospace; overflow:hidden; }
+  #ui { position:fixed; top:10px; left:10px; background:rgba(17,17,17,0.8); padding:10px; border:1px solid #0f0; z-index:10; }
+  select { background:#000; color:#0f0; border:1px solid #0f0; font-family:monospace; margin-bottom: 5px; }
+  .label { display: inline-block; width: 90px; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div><span class="label">Method:</span>
+    <select id="method">
+      <option value="GRID">-Indexing</option>
+      <option value="HASH">Spatial Hash</option>
+      <option value="SAP">Sweep & Prune</option>
+      <option value="QT">Quadtree</option>
+    </select>
+  </div>
+  <div><span class="label">FPS:</span> <span id="fps">0</span></div>
+  <div><span class="label">App Heap:</span> <span id="heap">-</span></div>
+  <div><span class="label">Struct Size:</span> <span id="structMemory" style="color:#0ff;">-</span></div>
+</div>
+
+<canvas id="c"></canvas>
+
+<script>
+// ================= Canvas =================
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+canvas.width = innerWidth;
+canvas.height = innerHeight;
+
+// ================= Constants =================
+const N = 10000;
+const RANGE = 800;
+const CELL = 40;
+
+// ================= Data (2D Unified) =================
+let px = new Float32Array(N);
+let py = new Float32Array(N);
+let vx = new Float32Array(N);
+let vy = new Float32Array(N);
+
+// Grid / Hash
+let gridCols, gridRows, gridCount;
+let gridHead, nextPoint;
+let hashCells = [];
+
+// SAP
+let sapIndex = new Int32Array(N);
+let sapInv = new Int32Array(N);
+
+// Quadtree (Object Pool)
+let qtPool = [];
+let qtCount = 0;
+const QT_MAX = 16;
+const QT_MAX_DEPTH = 6;
+let quadRoot;
+
+// ================= Init =================
+function init() {
+  gridCols = Math.ceil(RANGE / CELL);
+  gridRows = gridCols;
+  gridCount = gridCols * gridRows;
+
+  gridHead = new Int32Array(gridCount);
+  nextPoint = new Int32Array(N);
+
+  for (let i = 0; i < gridCount; i++) hashCells.push([]);
+
+  for (let i = 0; i < N; i++) {
+    px[i] = (Math.random() - 0.5) * RANGE;
+    py[i] = (Math.random() - 0.5) * RANGE;
+    vx[i] = (Math.random() - 0.5) * 1.5;
+    vy[i] = (Math.random() - 0.5) * 1.5;
+    sapIndex[i] = i;
+  }
+}
+
+function gridKey(x, y) {
+  const gx = ((x + RANGE / 2) / CELL) | 0;
+  const gy = ((y + RANGE / 2) / CELL) | 0;
+  if (gx < 0 || gy < 0 || gx >= gridCols || gy >= gridRows) return -1;
+  return gy * gridCols + gx;
+}
+
+// ================= 1. Grid (-Indexing型) =================
+function buildGrid() {
+  gridHead.fill(-1);
+  for (let i = 0; i < N; i++) {
+    const k = gridKey(px[i], py[i]);
+    if (k < 0) continue;
+    nextPoint[i] = gridHead[k];
+    gridHead[k] = i;
+  }
+}
+
+function neighborsGrid(i) {
+  let c = 0;
+  const x = px[i], y = py[i];
+  const gx = ((x + RANGE / 2) / CELL) | 0;
+  const gy = ((y + RANGE / 2) / CELL) | 0;
+
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const nx = gx + dx, ny = gy + dy;
+      if (nx < 0 || ny < 0 || nx >= gridCols || ny >= gridRows) continue;
+      let j = gridHead[ny * gridCols + nx];
+      while (j !== -1) {
+        if (j !== i && Math.abs(px[j]-x) <= CELL && Math.abs(py[j]-y) <= CELL) c++;
+        j = nextPoint[j];
+      }
+    }
+  }
+  return c;
+}
+
+// ================= 2. Spatial Hash =================
+function buildHash() {
+  for (let i = 0; i < gridCount; i++) hashCells[i].length = 0;
+  for (let i = 0; i < N; i++) {
+    const k = gridKey(px[i], py[i]);
+    if (k >= 0) hashCells[k].push(i);
+  }
+}
+
+function neighborsHash(i) {
+  let c = 0;
+  const x = px[i], y = py[i];
+  const gx = ((x + RANGE / 2) / CELL) | 0;
+  const gy = ((y + RANGE / 2) / CELL) | 0;
+
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const nx = gx + dx, ny = gy + dy;
+      if (nx < 0 || ny < 0 || nx >= gridCols || ny >= gridRows) continue;
+      const arr = hashCells[ny * gridCols + nx];
+      for (let k = 0, len = arr.length; k < len; k++) {
+        const j = arr[k];
+        if (j !== i && Math.abs(px[j]-x) <= CELL && Math.abs(py[j]-y) <= CELL) c++;
+      }
+    }
+  }
+  return c;
+}
+
+// ================= 3. Sweep & Prune =================
+function buildSAP() {
+  sapIndex.sort((a, b) => px[a] - px[b]);
+  for (let k = 0; k < N; k++) sapInv[sapIndex[k]] = k;
+}
+
+function neighborsSAP(i) {
+  let c = 0;
+  const x = px[i], y = py[i];
+  const idx = sapInv[i];
+
+  for (let k = idx + 1; k < N; k++) {
+    const j = sapIndex[k];
+    if (px[j] - x > CELL) break;
+    if (Math.abs(py[j] - y) <= CELL) c++;
+  }
+  for (let k = idx - 1; k >= 0; k--) {
+    const j = sapIndex[k];
+    if (x - px[j] > CELL) break;
+    if (Math.abs(py[j] - y) <= CELL) c++;
+  }
+  return c;
+}
+
+// ================= 4. Quadtree =================
+function getQTNode(x, y, w, h, depth) {
+  let node;
+  if (qtCount < qtPool.length) {
+    node = qtPool[qtCount++];
+    node.x = x; node.y = y; node.w = w; node.h = h; node.depth = depth;
+    node.points.length = 0;
+    node.children = null;
+  } else {
+    node = { x, y, w, h, depth, points: [], children: null };
+    qtPool.push(node);
+    qtCount++;
+  }
+  return node;
+}
+
+function qtInsert(node, i) {
+  if (node.children) {
+    const cx = px[i] > node.x ? 1 : 0;
+    const cy = py[i] > node.y ? 1 : 0;
+    qtInsert(node.children[(cy << 1) | cx], i);
+    return;
+  }
+
+  node.points.push(i);
+
+  if (node.points.length > QT_MAX && node.depth < QT_MAX_DEPTH) {
+    node.children = new Array(4);
+    const hw = node.w / 2, hh = node.h / 2;
+    node.children[0] = getQTNode(node.x - hw/2, node.y - hh/2, hw, hh, node.depth + 1);
+    node.children[1] = getQTNode(node.x + hw/2, node.y - hh/2, hw, hh, node.depth + 1);
+    node.children[2] = getQTNode(node.x - hw/2, node.y + hh/2, hw, hh, node.depth + 1);
+    node.children[3] = getQTNode(node.x + hw/2, node.y + hh/2, hw, hh, node.depth + 1);
+
+    for (let k = 0, len = node.points.length; k < len; k++) {
+      const p = node.points[k];
+      const cx = px[p] > node.x ? 1 : 0;
+      const cy = py[p] > node.y ? 1 : 0;
+      qtInsert(node.children[(cy << 1) | cx], p);
+    }
+    node.points.length = 0; 
+  }
+}
+
+function buildQuadtree() {
+  qtCount = 0;
+  quadRoot = getQTNode(0, 0, RANGE, RANGE, 0);
+  for (let i = 0; i < N; i++) qtInsert(quadRoot, i);
+}
+
+function qtQuery(node, i, range, callback) {
+  if (!node) return;
+  if (Math.abs(node.x - px[i]) > node.w / 2 + range) return;
+  if (Math.abs(node.y - py[i]) > node.h / 2 + range) return;
+
+  if (!node.children) {
+    for (let k = 0, len = node.points.length; k < len; k++) {
+      const p = node.points[k];
+      if (p !== i && Math.abs(px[p]-px[i]) <= range && Math.abs(py[p]-py[i]) <= range) callback(p);
+    }
+    return;
+  }
+  for (let c = 0; c < 4; c++) qtQuery(node.children[c], i, range, callback);
+}
+
+function neighborsQT(i) {
+  let c = 0;
+  qtQuery(quadRoot, i, CELL, () => c++);
+  return c;
+}
+
+// ================= Memory Calculation =================
+function updateStructMemory(method) {
+  let bytes = 0;
+
+  if (method === "GRID") {
+    // Int32Array (4 bytes per element)
+    bytes = gridHead.byteLength + nextPoint.byteLength;
+  } 
+  else if (method === "HASH") {
+    // JS Array overhead (approx 8 bytes per slot) + contents (approx 8 bytes per number)
+    bytes = (gridCount * 8) + (N * 8);
+  } 
+  else if (method === "SAP") {
+    // Int32Array (4 bytes per element)
+    bytes = sapIndex.byteLength + sapInv.byteLength;
+  } 
+  else if (method === "QT") {
+    // Object overhead (approx 64 bytes per node) + point arrays
+    bytes = (qtPool.length * 64) + (N * 8);
+  }
+
+  let displayStr = "";
+  if (bytes < 1024) displayStr = bytes + " B";
+  else if (bytes < 1024 * 1024) displayStr = (bytes / 1024).toFixed(1) + " KB";
+  else displayStr = (bytes / 1024 / 1024).toFixed(2) + " MB";
+
+  document.getElementById("structMemory").textContent = displayStr;
+}
+
+// ================= Main Loop =================
+let last = performance.now();
+let frames = 0;
+
+function loop() {
+  const method = document.getElementById("method").value;
+
+  // Build index
+  if (method === "GRID") buildGrid();
+  else if (method === "HASH") buildHash();
+  else if (method === "SAP") buildSAP();
+  else if (method === "QT") buildQuadtree();
+
+  // Neighbor search
+  let totalNeighbors = 0;
+  for (let i = 0; i < N; i++) {
+    if (method === "GRID") totalNeighbors += neighborsGrid(i);
+    else if (method === "HASH") totalNeighbors += neighborsHash(i);
+    else if (method === "SAP") totalNeighbors += neighborsSAP(i);
+    else if (method === "QT") totalNeighbors += neighborsQT(i);
+  }
+
+  // Move points
+  for (let i = 0; i < N; i++) {
+    px[i] += vx[i];
+    py[i] += vy[i];
+    if (px[i] > RANGE / 2 || px[i] < -RANGE / 2) vx[i] *= -1;
+    if (py[i] > RANGE / 2 || py[i] < -RANGE / 2) vy[i] *= -1;
+  }
+
+  // Draw
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.fillStyle = "#0f0";
+  for (let i = 0; i < N; i++) {
+    const x = (px[i] / RANGE) * canvas.width + canvas.width / 2;
+    const y = (py[i] / RANGE) * canvas.height + canvas.height / 2;
+    ctx.fillRect(x, y, 2, 2);
+  }
+
+  // Update metrics
+  frames++;
+  const now = performance.now();
+  if (now - last >= 1000) {
+    document.getElementById("fps").textContent = frames;
+    if (performance.memory) {
+      document.getElementById("heap").textContent =
+        (performance.memory.usedJSHeapSize / 1024 / 1024).toFixed(1) + " MB";
+    }
+    updateStructMemory(method);
+    frames = 0;
+    last = now;
+  }
+
+  requestAnimationFrame(loop);
+}
+
+// Handle window resize dynamically
+window.addEventListener('resize', () => {
+  canvas.width = innerWidth;
+  canvas.height = innerHeight;
+});
+
+init();
+loop();
+</script>
+</body>
+</html>
